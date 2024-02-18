@@ -22,6 +22,7 @@ class _ContextMenuDetector extends StatefulWidget {
     required this.contextMenuIsAllowed,
     required this.onShowContextMenu,
     required this.child,
+    this.primary = false,
   });
 
   final Widget child;
@@ -29,6 +30,7 @@ class _ContextMenuDetector extends StatefulWidget {
   final ContextMenuIsAllowed contextMenuIsAllowed;
   final Future<void> Function(Offset, Listenable, Function(bool))
       onShowContextMenu;
+  final bool primary;
 
   @override
   State<StatefulWidget> createState() => _ContextMenuDetectorState();
@@ -52,12 +54,13 @@ class _ContextMenuDetectorState extends State<_ContextMenuDetector> {
         keys.contains(LogicalKeyboardKey.controlLeft);
   }
 
-  bool _canAcceptEvent(PointerDownEvent event) {
+  bool _canAcceptEvent(PointerDownEvent event, {bool primary = false}) {
     if (event.kind != PointerDeviceKind.mouse) {
       return false;
     }
     if (event.buttons == kSecondaryButton ||
-        event.buttons == kPrimaryButton && _acceptPrimaryButton()) {
+        event.buttons == kPrimaryButton &&
+            (primary || _acceptPrimaryButton())) {
       return widget.contextMenuIsAllowed(event.position);
     }
 
@@ -98,7 +101,7 @@ class _ContextMenuDetectorState extends State<_ContextMenuDetector> {
           if (_activeDetector != null) {
             return;
           }
-          if (_canAcceptEvent(event)) {
+          if (_canAcceptEvent(event, primary: widget.primary)) {
             final menuResolvedCompleter = Completer<bool>();
             _showContextMenu(event.position, _onPointerUp, (value) {
               menuResolvedCompleter.complete(value);
@@ -144,6 +147,7 @@ class DesktopContextMenuWidget extends StatelessWidget {
     required this.contextMenuIsAllowed,
     required this.menuWidgetBuilder,
     this.iconTheme,
+    this.primary = false,
   });
 
   final HitTestBehavior hitTestBehavior;
@@ -151,6 +155,7 @@ class DesktopContextMenuWidget extends StatelessWidget {
   final ContextMenuIsAllowed contextMenuIsAllowed;
   final DesktopMenuWidgetBuilder menuWidgetBuilder;
   final Widget child;
+  final bool primary;
 
   /// Base icon theme for menu icons. The size will be overridden depending
   /// on platform.
@@ -159,6 +164,7 @@ class DesktopContextMenuWidget extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return _ContextMenuDetector(
+      primary: primary,
       hitTestBehavior: hitTestBehavior,
       contextMenuIsAllowed: contextMenuIsAllowed,
       onShowContextMenu: (position, pointerUpListenable, onMenuresolved) async {

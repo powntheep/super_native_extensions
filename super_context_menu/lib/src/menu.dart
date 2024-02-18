@@ -59,6 +59,7 @@ class ContextMenuWidget extends StatelessWidget {
     this.hitTestBehavior = HitTestBehavior.deferToChild,
     required this.menuProvider,
     this.iconTheme,
+    this.primary = false,
     this.contextMenuIsAllowed = _defaultContextMenuIsAllowed,
     MobileMenuWidgetBuilder? mobileMenuWidgetBuilder,
     DesktopMenuWidgetBuilder? desktopMenuWidgetBuilder,
@@ -80,6 +81,7 @@ class ContextMenuWidget extends StatelessWidget {
   final Widget child;
   final MobileMenuWidgetBuilder mobileMenuWidgetBuilder;
   final DesktopMenuWidgetBuilder desktopMenuWidgetBuilder;
+  final bool primary; 
 
   /// Base icon theme for menu icons. The size will be overridden depending
   /// on platform.
@@ -111,6 +113,7 @@ class ContextMenuWidget extends StatelessWidget {
             contextMenuIsAllowed: contextMenuIsAllowed,
             iconTheme: iconTheme,
             menuWidgetBuilder: desktopMenuWidgetBuilder,
+            primary: primary,
             child: child!,
           );
         }
