@@ -1,3 +1,33 @@
+## 0.8.16
+
+ - **FIX**: detect drag cancelled on desktop while waiting for data (#377).
+
+## 0.8.15
+
+## 0.8.14
+
+ - Bump "super_drag_and_drop" to `0.8.14`.
+
+## 0.8.13
+
+## 0.8.12
+
+## 0.8.11
+
+## 0.8.10
+
+## 0.8.9
+
+## 0.8.8
+
+## 0.8.7
+
+ - **FIX**: various exceptions when getting snapshots (#328).
+
+## 0.8.6
+
+ - **FIX**: various exceptions when getting snapshots (#327).
+
 ## 0.8.5
 
 ## 0.8.4

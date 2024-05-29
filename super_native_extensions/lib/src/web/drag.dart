@@ -1,9 +1,10 @@
-import 'dart:html' as html;
+import 'dart:js_interop';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/widgets.dart';
+import 'package:web/web.dart' as web;
 
 import '../drag.dart';
 import '../drag_interaction/long_press_session.dart';
@@ -88,9 +89,7 @@ class DragSessionImpl extends DragSession implements DragDriverDelegate {
       _dragging.value = false;
       _state = null;
       Future.microtask(() {
-        _dragCompleted.dispose();
-        _dragging.dispose();
-        _lastScreenLocation.dispose();
+        dispose();
         for (final item in configuration.items) {
           item.dataProvider.dispose();
         }
@@ -99,6 +98,12 @@ class DragSessionImpl extends DragSession implements DragDriverDelegate {
     if (_ended) {
       _state?.cancel();
     }
+  }
+
+  void dispose() {
+    _dragCompleted.dispose();
+    _dragging.dispose();
+    _lastScreenLocation.dispose();
   }
 
   _SessionState? _state;
@@ -238,25 +243,39 @@ class DragContextImpl extends DragContext {
   Future<void> initialize() async {
     super.initialize();
     // Long press draggable requires disabling context menu.
-    html.document.addEventListener('contextmenu', (event) {
-      if (PointerDeviceKindDetector.instance.current.value ==
-          PointerDeviceKind.touch) {
-        final offset_ = (event as html.MouseEvent).offset;
-        final offset = ui.Offset(offset_.x.toDouble(), offset_.y.toDouble());
-        final draggable = delegate?.isLocationDraggable(offset) ?? false;
-        if (draggable) {
-          event.preventDefault();
+    web.document.addEventListener(
+      'contextmenu',
+      (web.MouseEvent event) {
+        if (PointerDeviceKindDetector.instance.current.value ==
+            PointerDeviceKind.touch) {
+          final offset = ui.Offset(
+            event.offsetX.toDouble(),
+            event.offsetY.toDouble(),
+          );
+          final draggable = delegate?.isLocationDraggable(offset) ?? false;
+          if (draggable) {
+            event.preventDefault();
+          }
+          if (LongPressSession.active) {
+            event.preventDefault();
+          }
         }
-        if (LongPressSession.active) {
-          event.preventDefault();
-        }
-      }
-    });
+      }.toJS,
+    );
   }
 
   @override
   DragSession newSession({int? pointer}) =>
       DragSessionImpl(pointer: pointer ?? -1);
+
+  @override
+  void cancelSession(DragSession session) {
+    final sessionImpl = session as DragSessionImpl;
+    assert(sessionImpl.dragCompleted.value == null);
+    assert(sessionImpl.dragging.value == false);
+    sessionImpl._dragCompleted.value = DropOperation.userCancelled;
+    session.dispose();
+  }
 
   @override
   Future<void> startDrag({
