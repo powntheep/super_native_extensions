@@ -2,22 +2,31 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     fmt::Formatter,
+    ops::Deref,
     ptr::NonNull,
     rc::{Rc, Weak},
     time::Duration,
 };
 
-use block2::RcBlock;
+use block2::{Block, RcBlock};
 use irondash_engine_context::EngineContext;
 use irondash_message_channel::{IsolateId, Late};
 use irondash_run_loop::{platform::PollSession, spawn, RunLoop};
-use objc2_foundation::{CGPoint, CGRect, CGSize, NSArray, NSString};
+use objc2_foundation::{CGPoint, CGRect, CGSize, MainThreadMarker, NSArray, NSString};
 
 use objc2::{
     declare_class, msg_send_id, mutability,
-    rc::Id,
+    rc::{Id, Retained},
     runtime::{NSObject, NSObjectProtocol, ProtocolObject},
-    ClassType, DeclaredClass,
+    sel, ClassType, DeclaredClass,
+};
+use objc2_ui_kit::{
+    UIAction, UIActivityIndicatorView, UIActivityIndicatorViewStyle, UIColor,
+    UIContextMenuConfiguration, UIContextMenuInteraction, UIContextMenuInteractionAnimating,
+    UIContextMenuInteractionDelegate, UIDeferredMenuElement, UIGestureRecognizerState, UIImage,
+    UIImageView, UIMenu, UIMenuElement, UIMenuElementAttributes, UIMenuElementState, UIMenuOptions,
+    UIPanGestureRecognizer, UIPreviewParameters, UIPreviewTarget, UITargetedPreview, UIView,
+    UIViewAnimationOptions, UIViewController,
 };
 
 use crate::{
@@ -27,27 +36,11 @@ use crate::{
     },
     error::{NativeExtensionsError, NativeExtensionsResult},
     menu_manager::{PlatformMenuContextDelegate, PlatformMenuContextId, PlatformMenuDelegate},
-    platform_impl::platform::os::{
-        uikit::{UIMenu, UIMenuOptionsDisplayInline},
-        util::{image_view_from_data, IgnoreInteractionEvents},
-    },
+    platform_impl::platform::os::util::{image_view_from_data, IgnoreInteractionEvents},
     value_promise::PromiseResult,
 };
 
-use super::{
-    alpha_to_path::bezier_path_for_alpha,
-    uikit::{
-        UIAction, UIActivityIndicatorView, UIActivityIndicatorViewStyleMedium, UIColor,
-        UIContextMenuConfiguration, UIContextMenuInteraction, UIContextMenuInteractionAnimating,
-        UIContextMenuInteractionDelegate, UIDeferredMenuElement,
-        UIDeferredMenuElementCompletionBlock, UIImage, UIImageView, UIMenuElement,
-        UIMenuElementAttributes, UIMenuElementAttributesDestructive,
-        UIMenuElementAttributesDisabled, UIMenuElementState, UIMenuElementStateMixed,
-        UIMenuElementStateOff, UIMenuElementStateOn, UIPreviewParameters, UIPreviewTarget,
-        UITargetedPreview, UIView, UIViewAnimationOptionNone, UIViewController,
-    },
-    util::image_from_image_data,
-};
+use super::{alpha_to_path::bezier_path_for_alpha, util::image_from_image_data};
 
 pub struct PlatformMenuContext {
     id: PlatformMenuContextId,
@@ -57,11 +50,14 @@ pub struct PlatformMenuContext {
     interaction: Late<Id<UIContextMenuInteraction>>,
     interaction_delegate: Late<Id<SNEMenuContext>>,
     sessions: RefCell<HashMap<usize, MenuSession>>,
+    fading_containers: RefCell<Vec<Retained<UIView>>>,
+    mtm: MainThreadMarker,
 }
 
 pub struct PlatformMenu {
     ui_menu: Id<UIMenu>,
     item_selected: Rc<Cell<bool>>,
+    mtm: MainThreadMarker,
 }
 
 impl std::fmt::Debug for PlatformMenu {
@@ -70,12 +66,15 @@ impl std::fmt::Debug for PlatformMenu {
     }
 }
 
+pub type UIDeferredMenuElementCompletionBlock = Block<dyn Fn(NonNull<NSArray<UIMenuElement>>)>;
+
 impl PlatformMenu {
     pub fn new(
         isolate: IsolateId,
         delegate: Weak<dyn PlatformMenuDelegate>,
         menu: Menu,
     ) -> NativeExtensionsResult<Rc<Self>> {
+        let mtm = MainThreadMarker::new().unwrap();
         let item_selected = Rc::new(Cell::new(false));
         let res = Self {
             item_selected: item_selected.clone(),
@@ -85,8 +84,10 @@ impl PlatformMenu {
                     isolate,
                     &delegate,
                     item_selected,
+                    mtm,
                 )?)
             },
+            mtm,
         };
         Ok(Rc::new(res))
     }
@@ -111,6 +112,7 @@ impl PlatformMenu {
         isolate_id: IsolateId,
         delegate: &Weak<dyn PlatformMenuDelegate>,
         item_selected: Rc<Cell<bool>>,
+        mtm: MainThreadMarker,
     ) -> NativeExtensionsResult<Vec<Id<UIMenuElement>>> {
         let mut res = Vec::new();
 
@@ -123,6 +125,7 @@ impl PlatformMenu {
 
         unsafe fn finish_inline_section(
             inline_section: Option<InlineSection>,
+            mtm: MainThreadMarker,
         ) -> Vec<Id<UIMenuElement>> {
             if let Some(inline_section) = inline_section {
                 let elements = NSArray::from_vec(inline_section.elements);
@@ -130,8 +133,9 @@ impl PlatformMenu {
                     &inline_section.title,
                     None,
                     None,
-                    UIMenuOptionsDisplayInline,
+                    UIMenuOptions::DisplayInline,
                     &elements,
+                    mtm,
                 );
                 vec![Id::into_super(res)]
             } else {
@@ -142,15 +146,20 @@ impl PlatformMenu {
         for element in elements {
             match element {
                 MenuElement::Separator(separator) => {
-                    res.append(&mut finish_inline_section(inline_section));
+                    res.append(&mut finish_inline_section(inline_section, mtm));
                     inline_section = Some(InlineSection {
                         title: Self::convert_string(&separator.title).unwrap_or_default(),
                         elements: Vec::new(),
                     });
                 }
                 element => {
-                    let converted =
-                        Self::convert_menu(element, isolate_id, delegate, item_selected.clone())?;
+                    let converted = Self::convert_menu(
+                        element,
+                        isolate_id,
+                        delegate,
+                        item_selected.clone(),
+                        mtm,
+                    )?;
                     if let Some(inline_section) = inline_section.as_mut() {
                         inline_section.elements.push(converted);
                     } else {
@@ -160,7 +169,7 @@ impl PlatformMenu {
             }
         }
 
-        res.append(&mut finish_inline_section(inline_section));
+        res.append(&mut finish_inline_section(inline_section, mtm));
 
         Ok(res)
     }
@@ -170,54 +179,66 @@ impl PlatformMenu {
         isolate_id: IsolateId,
         delegate: &Weak<dyn PlatformMenuDelegate>,
         item_selected: Rc<Cell<bool>>,
+        mtm: MainThreadMarker,
     ) -> NativeExtensionsResult<Id<UIMenuElement>> {
         match menu {
             MenuElement::Action(action) => {
                 let unique_id = action.unique_id;
                 let delegate = delegate.clone();
-                let handler = RcBlock::new(move |_| {
+                let handler = RcBlock::new(move |_: NonNull<UIAction>| {
                     item_selected.set(true);
                     if let Some(delegate) = delegate.upgrade() {
                         delegate.on_action(isolate_id, unique_id);
                     }
                 });
+
                 let res = UIAction::actionWithTitle_image_identifier_handler(
                     &Self::convert_string(&action.title).unwrap_or_default(),
                     Self::convert_image(&action.image).as_deref(),
                     Self::convert_string(&action.identifier).as_deref(),
-                    &handler,
+                    handler.deref() as *const _ as *mut _,
+                    mtm,
                 );
-                let mut options: UIMenuElementAttributes = 0;
-                if action.attributes.disabled {
-                    options |= UIMenuElementAttributesDisabled;
-                }
-                if action.attributes.destructive {
-                    options |= UIMenuElementAttributesDestructive;
-                }
+                let mut options = UIMenuElementAttributes::empty();
+                options.set(
+                    UIMenuElementAttributes::Disabled,
+                    action.attributes.disabled,
+                );
+                options.set(
+                    UIMenuElementAttributes::Destructive,
+                    action.attributes.destructive,
+                );
+
                 res.setAttributes(options);
 
                 let state: UIMenuElementState = match action.state {
-                    MenuActionState::None => UIMenuElementStateOff,
-                    MenuActionState::CheckOff => UIMenuElementStateOff,
-                    MenuActionState::RadioOff => UIMenuElementStateOff,
-                    MenuActionState::CheckOn => UIMenuElementStateOn,
-                    MenuActionState::RadioOn => UIMenuElementStateOn,
-                    MenuActionState::CheckMixed => UIMenuElementStateMixed,
+                    MenuActionState::None => UIMenuElementState::Off,
+                    MenuActionState::CheckOff => UIMenuElementState::Off,
+                    MenuActionState::RadioOff => UIMenuElementState::Off,
+                    MenuActionState::CheckOn => UIMenuElementState::On,
+                    MenuActionState::RadioOn => UIMenuElementState::On,
+                    MenuActionState::CheckMixed => UIMenuElementState::Mixed,
                 };
                 res.setState(state);
 
                 Ok(Id::into_super(res))
             }
             MenuElement::Menu(menu) => {
-                let children =
-                    Self::convert_elements(menu.children, isolate_id, delegate, item_selected)?;
+                let children = Self::convert_elements(
+                    menu.children,
+                    isolate_id,
+                    delegate,
+                    item_selected,
+                    mtm,
+                )?;
                 let children = NSArray::from_vec(children);
                 let menu = UIMenu::menuWithTitle_image_identifier_options_children(
                     &Self::convert_string(&menu.title).unwrap_or_default(),
                     Self::convert_image(&menu.image).as_deref(),
                     Self::convert_string(&menu.identifier).as_deref(),
-                    0,
+                    UIMenuOptions::empty(),
                     &children,
+                    mtm,
                 );
                 Ok(Id::into_super(menu))
             }
@@ -242,6 +263,7 @@ impl PlatformMenu {
                                             isolate_id,
                                             &Rc::downgrade(&delegate),
                                             item_selected,
+                                            mtm,
                                         );
                                         match elements {
                                             Ok(elements) => Some(NSArray::from_vec(elements)),
@@ -259,7 +281,7 @@ impl PlatformMenu {
                     },
                 );
 
-                let res = UIDeferredMenuElement::elementWithProvider(&provider);
+                let res = UIDeferredMenuElement::elementWithProvider(&provider, mtm);
                 Ok(Id::into_super(res))
             }
             MenuElement::Separator(_separator) => {
@@ -274,6 +296,7 @@ struct MenuSession {
     view_container: Id<UIView>,
     view_controller: Id<UIViewController>,
     configuration: MenuConfiguration,
+    mtm: MainThreadMarker,
 }
 
 impl MenuSession {
@@ -282,7 +305,7 @@ impl MenuSession {
     }
 
     fn update_preview_image(&self, image: ImageData) {
-        let preview_view = image_view_from_data(image);
+        let preview_view = image_view_from_data(image, self.mtm);
         unsafe {
             let view = self.view_controller.view().unwrap();
 
@@ -306,7 +329,12 @@ impl MenuSession {
             let completion = RcBlock::new(move |_| {
                 prev_subview.removeFromSuperview();
             });
-            UIView::animateWithDuration_animations_completion(0.25, &animation, Some(&completion));
+            UIView::animateWithDuration_animations_completion(
+                0.25,
+                &animation,
+                Some(&completion),
+                self.mtm,
+            );
         }
     }
 }
@@ -317,6 +345,7 @@ impl PlatformMenuContext {
         engine_handle: i64,
         delegate: Weak<dyn PlatformMenuContextDelegate>,
     ) -> NativeExtensionsResult<Self> {
+        let mtm = MainThreadMarker::new().unwrap();
         let view = EngineContext::get()?.get_flutter_view(engine_handle)?;
 
         Ok(Self {
@@ -327,21 +356,38 @@ impl PlatformMenuContext {
             interaction: Late::new(),
             interaction_delegate: Late::new(),
             sessions: RefCell::new(HashMap::new()),
+            fading_containers: RefCell::new(Vec::new()),
+            mtm,
         })
     }
 
     pub fn assign_weak_self(&self, weak_self: Weak<Self>) {
         self.weak_self.set(weak_self.clone());
-        let delegate = SNEMenuContext::new(weak_self);
+        let delegate = SNEMenuContext::new(weak_self, self.mtm);
         self.interaction_delegate.set(delegate.retain());
         let interaction = unsafe {
             UIContextMenuInteraction::initWithDelegate(
-                UIContextMenuInteraction::alloc(),
-                &Id::cast(delegate),
+                self.mtm.alloc::<UIContextMenuInteraction>(),
+                &Id::cast(delegate.clone()),
             )
         };
-        unsafe { self.view.addInteraction(&interaction) };
+        unsafe {
+            self.view
+                .addInteraction(&Retained::cast(interaction.clone()))
+        };
         self.interaction.set(interaction);
+
+        unsafe {
+            let recognizer = UIPanGestureRecognizer::initWithTarget_action(
+                self.mtm.alloc::<UIPanGestureRecognizer>(),
+                Some(&Id::cast(delegate.clone())),
+                Some(sel!(onGesture:)),
+            );
+            recognizer.setDelaysTouchesBegan(false);
+            recognizer.setDelaysTouchesEnded(false);
+            recognizer.setCancelsTouchesInView(false);
+            self.view.addGestureRecognizer(&recognizer);
+        }
     }
 
     pub fn menu_active(&self) -> bool {
@@ -375,20 +421,23 @@ impl PlatformMenuContext {
         _interaction: &UIContextMenuInteraction,
         menu_configuration: MenuConfiguration,
     ) -> Id<UIContextMenuConfiguration> {
-        let view_controller = unsafe { UIViewController::init(UIViewController::alloc()) };
+        let view_controller =
+            unsafe { UIViewController::init(self.mtm.alloc::<UIViewController>()) };
 
         let menu = menu_configuration.menu.as_ref().unwrap().ui_menu.clone();
         let configuration = unsafe {
             let menu = Rc::new(menu); // Id is not Clone
             let action_provider =
-                RcBlock::new(move |_suggested| Id::autorelease_return(menu.retain()));
+                RcBlock::new(move |_suggested: NonNull<NSArray<UIMenuElement>>| {
+                    Id::autorelease_return(menu.retain())
+                });
 
             let preview_provider = match (
                 menu_configuration.preview_image.as_ref(),
                 menu_configuration.preview_size.as_ref(),
             ) {
                 (Some(preview_image), None) => {
-                    let preview_view = image_view_from_data(preview_image.clone());
+                    let preview_view = image_view_from_data(preview_image.clone(), self.mtm);
                     let size = CGSize {
                         width: preview_image.point_width(),
                         height: preview_image.point_height(),
@@ -413,11 +462,11 @@ impl PlatformMenuContext {
                                 return Id::autorelease_return(controller.retain());
                             }
                         }
-                        let view = UIView::initWithFrame(UIView::alloc(), CGRect::ZERO);
+                        let view = UIView::initWithFrame(self.mtm.alloc::<UIView>(), CGRect::ZERO);
                         let activity_indicator = {
                             let res = UIActivityIndicatorView::initWithActivityIndicatorStyle(
-                                UIActivityIndicatorView::alloc(),
-                                UIActivityIndicatorViewStyleMedium,
+                                self.mtm.alloc::<UIActivityIndicatorView>(),
+                                UIActivityIndicatorViewStyle::Medium,
                             );
                             res.startAnimating();
                             res.setCenter(CGPoint {
@@ -438,13 +487,17 @@ impl PlatformMenuContext {
 
             UIContextMenuConfiguration::configurationWithIdentifier_previewProvider_actionProvider(
                 None,
-                preview_provider.as_deref(),
-                Some(&action_provider),
+                preview_provider
+                    .as_deref()
+                    .map(|p| p as *const _ as *mut _)
+                    .unwrap_or(std::ptr::null_mut()),
+                action_provider.deref() as *const _ as *mut _,
+                self.mtm,
             )
         };
         let view_container = unsafe {
             let bounds = self.view.bounds();
-            let container = UIView::initWithFrame(UIView::alloc(), bounds);
+            let container = UIView::initWithFrame(self.mtm.alloc::<UIView>(), bounds);
             container.setUserInteractionEnabled(false);
             self.view.addSubview(&container);
             container
@@ -455,11 +508,19 @@ impl PlatformMenuContext {
             view_container,
             configuration: menu_configuration,
             view_controller,
+            mtm: self.mtm,
         };
         self.sessions
             .borrow_mut()
             .insert(MenuSession::get_id(&configuration), session);
         configuration
+    }
+
+    fn on_pan_recognized(&self) {
+        let containers = self.fading_containers.borrow();
+        for container in containers.iter() {
+            container.setHidden(true);
+        }
     }
 
     fn configuration_for_menu_at_location(
@@ -506,11 +567,11 @@ impl PlatformMenuContext {
         match session {
             Some(session) => unsafe {
                 let image = &session.configuration.lift_image;
-                let lift_image = image_view_from_data(image.image_data.clone());
+                let lift_image = image_view_from_data(image.image_data.clone(), self.mtm);
                 let frame: CGRect = image.rect.translated(-100000.0, -100000.0).into();
                 lift_image.setFrame(frame);
                 session.view_container.addSubview(&lift_image);
-                let parameters = UIPreviewParameters::init(UIPreviewParameters::alloc());
+                let parameters = UIPreviewParameters::init(self.mtm.alloc::<UIPreviewParameters>());
                 let shadow_path = bezier_path_for_alpha(&image.image_data);
                 parameters.setShadowPath(Some(&shadow_path));
 
@@ -530,13 +591,13 @@ impl PlatformMenuContext {
 
                 let center: CGPoint = image.rect.center().into();
                 let target = UIPreviewTarget::initWithContainer_center(
-                    UIPreviewTarget::alloc(),
+                    self.mtm.alloc::<UIPreviewTarget>(),
                     &session.view_container,
                     center,
                 );
 
                 let preview = UITargetedPreview::initWithView_parameters_target(
-                    UITargetedPreview::alloc(),
+                    self.mtm.alloc::<UITargetedPreview>(),
                     &lift_image,
                     &parameters,
                     &target,
@@ -576,24 +637,29 @@ impl PlatformMenuContext {
     }
 
     fn interaction_will_end_for_configuration(
-        &self,
+        self: &Rc<Self>,
         _interaction: &UIContextMenuInteraction,
         configuration: &UIContextMenuConfiguration,
         _animator: Option<&ProtocolObject<dyn UIContextMenuInteractionAnimating>>,
     ) {
-        let session = self
-            .sessions
-            .borrow_mut()
-            .remove(&MenuSession::get_id(configuration));
+        let session_id = MenuSession::get_id(configuration);
+        let session = self.sessions.borrow_mut().remove(&session_id);
         if let Some(session) = session {
             unsafe {
                 let container = session.view_container.clone();
+                self.fading_containers.borrow_mut().push(container.clone());
+                let container_clone = container.clone();
                 let animation = RcBlock::new(move || {
-                    container.setAlpha(0.0);
+                    container_clone.setAlpha(0.0);
                 });
 
+                let self_clone = self.clone();
                 let completion = RcBlock::new(move |_| {
                     session.view_container.removeFromSuperview();
+                    self_clone
+                        .fading_containers
+                        .borrow_mut()
+                        .retain(|c| c != &container);
                 });
 
                 // Immediately fading out looks glitchy because it happens during menu -> lift
@@ -602,9 +668,10 @@ impl PlatformMenuContext {
                 UIView::animateWithDuration_delay_options_animations_completion(
                     0.25,
                     0.25,
-                    UIViewAnimationOptionNone,
+                    UIViewAnimationOptions::empty(),
                     &animation,
                     Some(&completion),
+                    self.mtm,
                 );
             }
             if let Some(delegate) = self.delegate.upgrade() {
@@ -625,7 +692,10 @@ impl PlatformMenuContext {
 
 impl Drop for PlatformMenuContext {
     fn drop(&mut self) {
-        unsafe { self.view.removeInteraction(&self.interaction) };
+        unsafe {
+            self.view
+                .removeInteraction(&Retained::cast(self.interaction.clone()))
+        };
     }
 }
 
@@ -652,7 +722,7 @@ declare_class!(
 
     unsafe impl ClassType for SNEMenuContext {
         type Super = NSObject;
-        type Mutability = mutability::InteriorMutable;
+        type Mutability = mutability::MainThreadOnly;
         const NAME: &'static str = "SNEMenuContext";
     }
 
@@ -661,6 +731,19 @@ declare_class!(
     }
 
     unsafe impl NSObjectProtocol for SNEMenuContext {}
+
+    #[allow(non_snake_case)]
+    unsafe impl SNEMenuContext {
+        #[method(onGesture:)]
+        fn onGesture(&self, detector: &UIPanGestureRecognizer) {
+            if detector.state() == UIGestureRecognizerState::Began {
+                self.ivars().with_state(
+                    |state| state.on_pan_recognized(),
+                    || {},
+                );
+            }
+        }
+    }
 
     #[allow(non_snake_case)]
     unsafe impl UIContextMenuInteractionDelegate for SNEMenuContext {
@@ -753,8 +836,8 @@ declare_class!(
 );
 
 impl SNEMenuContext {
-    fn new(context: Weak<PlatformMenuContext>) -> Id<Self> {
-        let this = Self::alloc();
+    fn new(context: Weak<PlatformMenuContext>, mtm: MainThreadMarker) -> Id<Self> {
+        let this = mtm.alloc::<Self>();
         let this = this.set_ivars(Inner { context });
         unsafe { msg_send_id![super(this), init] }
     }
